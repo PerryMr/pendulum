@@ -1,4 +1,4 @@
-function PendulumControlGUI_Direct()
+function PendulumControlGUI()
     %PENDULUMCONTROLGUI_DIRECT GUI para control directo del péndulo invertido
     %   Versión simplificada sin swing-up ni botón limpiar
     %   Solo control PID/LQR directo del péndulo
