@@ -105,7 +105,7 @@ ControllerType current_controller = CONTROLLER_PID;
 SystemState system_state = STATE_IDLE;
 
 // PID gains
-float K_p = 0.1, K_i = 0.0008, K_d = 0.012;
+float K_p = 0.0, K_i = 0.0, K_d = 0.0;
 float pid_error_prev = 0.0, pid_integral = 0.0;
 
 // LQR gains
