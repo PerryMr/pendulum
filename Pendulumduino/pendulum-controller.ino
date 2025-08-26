@@ -1,17 +1,15 @@
 /**
-* @file pendulum-controller-stepper-swingup.ino
-* @brief Controlador de péndulo invertido - Swing-up con motor paso a paso
-* @author Versión corregida para swing-up con motor stepper únicamente
-* @date 2025-08-20
+* @file pendulum-controller-single-swing.ino
+* @brief Controlador de péndulo invertido - Swing-up con movimiento único
+* @author Versión modificada para swing-up con movimiento único preciso
+* @date 2025-08-22
 *
 * @details
-* CORRECCIONES PRINCIPALES:
-* 1. Swing-up realizado únicamente con motor paso a paso (stepper)
-* 2. Encoder solo como sensor para medir ángulo del péndulo
-* 3. Movimientos rápidos de swing-up: impulso fuerte -> parada -> espera ->
-impulso contrario
-* 4. Transición automática al control cuando péndulo alcanza ~180°
-* 5. Control PID/LQR sobre la función de transferencia del sistema
+* MODIFICACIONES PRINCIPALES:
+* 1. Swing-up con movimiento único: 180° forward + 45° backward
+* 2. Movimiento con máxima fuerza y rapidez
+* 3. Monitoreo constante del encoder del péndulo
+* 4. Parámetros ajustables para reducir el recorrido si es necesario
 */
 #include "RotaryEncoder.h"
 #include "L6474.h"
@@ -52,6 +50,7 @@ static const unsigned int CMD_SET_PID_GAINS = 5;
 static const unsigned int CMD_SET_LQR_GAINS = 6;
 static const unsigned int CMD_START_CONTROL = 7;
 static const unsigned int CMD_STOP_CONTROL = 8;
+static const unsigned int CMD_SET_SWING_PARAMS = 9; // Nuevo comando
 
 // Status codes
 static const unsigned int STATUS_OK = 0;
@@ -59,6 +58,8 @@ static const unsigned int STATUS_STP_MOVING = 1;
 static const unsigned int STATUS_SWING_UP = 2;
 static const unsigned int STATUS_CONTROL_ACTIVE = 3;
 static const unsigned int STATUS_UPRIGHT_ACHIEVED = 4;
+static const unsigned int STATUS_SWING_FORWARD = 5;
+static const unsigned int STATUS_SWING_BACKWARD = 6;
 
 // Physical constants
 const float SAMPLE_TIME = 0.004; // 4ms sampling time
@@ -75,17 +76,18 @@ const int STP_STEPS_PER_ROTATION = 200;
 const float UPRIGHT_THRESHOLD = 15.0; // degrees from 180
 const float SETPOINT = 180.0; // Upright position in degrees
 
-// PARÁMETROS DE SWING-UP CON STEPPER OPTIMIZADOS
-const float SWING_IMPULSE_ANGLE = 35.0; // degrees - ángulo de impulso por movimiento
-const float SWING_IMPULSE_SPEED = 20.0; // steps/sec - velocidad del impulso
-const float SWING_WAIT_TIME = 1.3; // seconds - tiempo de espera entre impulsos
-const float SWING_MAX_DURATION = 45.0; // seconds - tiempo máximo
-const int SWING_MAX_CYCLES = 80; // máximo número de ciclos
-const float SWING_ENERGY_THRESHOLD = 15.0; // umbral de energía para incrementar impulso
+// PARÁMETROS DE SWING-UP MODIFICADO - MOVIMIENTO ÚNICO
+float SWING_FORWARD_ANGLE = 180.0;  // Ángulo de avance inicial (ajustable)
+float SWING_BACKWARD_ANGLE = 45.0;  // Ángulo de retroceso (ajustable)
+float SWING_FORWARD_SPEED = 3500.0; // Velocidad máxima para avance (steps/sec)
+float SWING_BACKWARD_SPEED = 1800.0; // Velocidad para retroceso (steps/sec)
+const float SWING_WAIT_BEFORE_BACKWARD = 5.0; // Tiempo de espera antes del retroceso (segundos)
+const float SWING_MAX_DURATION = 6.0; // Tiempo máximo para swing-up
+const float SWING_SUCCESS_THRESHOLD = 150.0; // Ángulo mínimo para considerar éxito
 
 // Variables globales adicionales para configuración dinámica
-bool swing_up_mode = false; // Flag para saber si estamos en modo swing-up
-int swing_up_div_per_step = 8; // Divisor de pasos para swing-up (menos micropasos)
+bool swing_up_mode = false;
+int swing_up_div_per_step = 4; // Divisor de pasos para swing-up (para más torque)
 
 // Controller selection
 typedef enum {
@@ -101,11 +103,13 @@ typedef enum {
   STATE_STOPPED = 3
 } SystemState;
 
-// Swing-up sub-states
+// Swing-up sub-states modificados para movimiento único
 typedef enum {
-  SWING_IMPULSE = 0,
-  SWING_WAIT = 1,
-  SWING_DIRECTION_CHANGE = 2
+  SWING_FORWARD_PHASE = 0,    // Movimiento hacia adelante 180°
+  SWING_WAIT_PHASE = 1,       // Espera breve
+  SWING_BACKWARD_PHASE = 2,   // Movimiento hacia atrás 45°
+  SWING_MONITOR_PHASE = 3,    // Monitoreo para verificar éxito
+  SWING_COMPLETED = 4         // Swing-up completado
 } SwingState;
 
 // Global variables
@@ -135,20 +139,15 @@ float theta_prev = 0.0;
 float dtheta = 0.0; // Pendulum angular velocity
 float integral_error = 0.0;
 
-// Swing-up variables
-float phi_reference = 0.0; // Referencia del stepper cuando se alcanza 180°
+// Swing-up variables modificadas para movimiento único
+float phi_reference = 0.0;
+float phi_start_position = 0.0; // Posición inicial del motor
+float theta_start_angle = 0.0;  // Ángulo inicial del péndulo
 unsigned long swing_start_time = 0;
 unsigned long swing_phase_start_time = 0;
-int swing_cycle_count = 0;
 bool upright_achieved = false;
-SwingState swing_state = SWING_IMPULSE;
-bool swing_direction = true; // true = positive direction, false = negative
-float current_impulse_angle = SWING_IMPULSE_ANGLE;
-float theta_max_achieved = 0.0; // Máximo ángulo alcanzado para ajuste automático
-
-// Energy estimation variables
-float pendulum_energy = 0.0;
-float energy_target = 50.0; // Energía objetivo para swing-up
+SwingState swing_state = SWING_FORWARD_PHASE;
+float theta_max_achieved = 0.0;
 
 // Timing variables
 unsigned long current_time = 0;
@@ -158,24 +157,24 @@ const unsigned long CONTROL_INTERVAL = 4; // 4ms = 250Hz
 
 // Debug variables
 unsigned long last_debug_print = 0;
-const unsigned long DEBUG_INTERVAL = 500; // Print debug cada 500ms
+const unsigned long DEBUG_INTERVAL = 200; // Print debug cada 200ms
 
-// Stepper configuration structures
+// Stepper configuration para swing-up con máxima potencia
 L6474_init_t stepper_config_swing_up = {
-  15000,    // acc
-  15000,    // dec
-  8000,     // max_speed
-  1000,     // min_speed
-  600,      // tval (corriente alta para swing-up)
-  L6474_OCD_TH_3750mA,
+  20000,    // acc - Aceleración máxima
+  20000,    // dec - Deceleración máxima
+  3500,     // max_speed - Velocidad alta
+  500,      // min_speed - Velocidad mínima
+  800,      // tval - Corriente máxima para torque alto
+  L6474_OCD_TH_4500mA, // Umbral de sobrecorriente alto
   L6474_CONFIG_OC_SD_ENABLE,
   L6474_CONFIG_EN_TQREG_TVAL_USED,
-  L6474_STEP_SEL_1_8,
+  L6474_STEP_SEL_1_4,  // Micropasos reducidos para mayor torque
   L6474_SYNC_SEL_1_2,
-  L6474_FAST_STEP_8us,
-  L6474_TOFF_FAST_4us,
-  5,
-  25,
+  L6474_FAST_STEP_4us,  // Tiempo de step rápido
+  L6474_TOFF_FAST_2us,  // Tiempo off rápido
+  3,
+  15,
   L6474_CONFIG_TOFF_024us,
   L6474_CONFIG_SR_320V_us,
   L6474_CONFIG_INT_16MHZ,
@@ -185,15 +184,15 @@ L6474_init_t stepper_config_swing_up = {
 };
 
 L6474_init_t stepper_config_control = {
-  10000,    // acc: Aceleración normal
-  10000,    // dec: Deceleración normal
-  3000,     // max_speed: Velocidad moderada para control fino
-  1000,     // min_speed: Velocidad mínima
-  400,      // tval: Corriente moderada para control
-  L6474_OCD_TH_1500mA, // Umbral de sobrecorriente normal
-  L6474_CONFIG_OC_SD_ENABLE, // Habilitar protecciones en control
+  8000,     // acc
+  8000,     // dec
+  1500,     // max_speed
+  200,      // min_speed
+  400,      // tval - Corriente moderada para control
+  L6474_OCD_TH_1500mA,
+  L6474_CONFIG_OC_SD_ENABLE,
   L6474_CONFIG_EN_TQREG_TVAL_USED,
-  L6474_STEP_SEL_1_16, // Micropasos para precisión en control
+  L6474_STEP_SEL_1_16, // Micropasos altos para precisión
   L6474_SYNC_SEL_1_2,
   L6474_FAST_STEP_12us,
   L6474_TOFF_FAST_8us,
@@ -262,11 +261,15 @@ void move_stepper_by(float deg) {
   stepper->move(stp_dir, steps);
 }
 
-void move_stepper_fast(float deg, float speed) {
-  // Configurar velocidad alta para swing-up
-  stepper->set_max_speed(speed);
-  stepper->set_acceleration(2000); // Aceleración alta para movimientos rápidos
+void move_stepper_fast_precise(float deg, float speed) {
+  // Configurar velocidad específica para el movimiento
+  stepper->set_max_speed((int)speed);
+  stepper->set_acceleration(20000); // Aceleración máxima
+  stepper->set_deceleration(15000); // Deceleración controlada
   move_stepper_by(deg);
+  
+  Serial.print("Movimiento preciso: "); Serial.print(deg, 1);
+  Serial.print("° a "); Serial.print(speed, 0); Serial.println(" steps/sec");
 }
 
 void set_step_mode(int mode) {
@@ -301,12 +304,6 @@ void update_states() {
   // Limit velocities to avoid noise spikes
   if (abs(dphi) > 1000.0) dphi = 0.0;
   if (abs(dtheta) > 1000.0) dtheta = 0.0;
-
-  // Calculate pendulum energy for swing-up control
-  // E = 1/2 * I * w^2 + m*g*l*(1-cos(theta))
-  float theta_rad = theta * PI / 180.0;
-  float dtheta_rad = dtheta * PI / 180.0;
-  pendulum_energy = 0.5 * dtheta_rad * dtheta_rad + sigma * (1.0 - cos(theta_rad));
 
   // Update integral error for control
   float error = SETPOINT - theta;
@@ -381,42 +378,42 @@ bool is_pendulum_upright() {
 }
 
 void configure_stepper_for_swing_up() {
-  Serial.println("=== CONFIGURANDO MOTOR PARA SWING-UP (MÁXIMA POTENCIA) ===");
+  Serial.println("=== CONFIGURANDO MOTOR PARA SWING-UP ÚNICO (MÁXIMA POTENCIA) ===");
   
-  // Aplicar solo los parámetros básicos que sabemos que funcionan
-  stepper->set_parameter(L6474_TVAL, 800); // Corriente alta
-  stepper->set_parameter(L6474_OCD_TH, L6474_OCD_TH_4500mA); // Umbral sobrecorriente alto
-  stepper->set_parameter(L6474_TON_MIN, 5);
-  stepper->set_parameter(L6474_TOFF_MIN, 25);
+  // Configurar parámetros para máxima potencia
+  stepper->set_parameter(L6474_TVAL, 800); // Corriente máxima
+  stepper->set_parameter(L6474_OCD_TH, L6474_OCD_TH_4500mA); // Umbral alto
+  stepper->set_parameter(L6474_TON_MIN, 3);
+  stepper->set_parameter(L6474_TOFF_MIN, 15);
   
   // Configurar micropasos para mayor torque
   stepper->set_step_mode(StepperMotor::STEP_MODE_1_4);
   div_per_step = swing_up_div_per_step;
   
-  // Configurar velocidades altas
-  stepper->set_max_speed(SWING_IMPULSE_SPEED);
-  stepper->set_acceleration(8000);
-  stepper->set_deceleration(8000);
+  // Configurar aceleraciones máximas
+  stepper->set_acceleration(20000);
+  stepper->set_deceleration(15000);
   
   swing_up_mode = true;
   
-  Serial.println("Motor configurado para swing-up (parámetros básicos)");
+  Serial.print("- Corriente: 800 (máxima)"); Serial.println();
+  Serial.print("- Micropasos: 1/4 (para torque)"); Serial.println();
+  Serial.print("- Aceleración: 20000 (máxima)"); Serial.println();
+  Serial.println("Motor listo para swing-up único");
 }
 
 void configure_stepper_for_control() {
-  Serial.println("=== CONFIGURANDO MOTOR PARA CONTROL (OPERACIÓN NORMAL) ===");
+  Serial.println("=== CONFIGURANDO MOTOR PARA CONTROL (PRECISIÓN) ===");
   
-  // Aplicar configuración de control directamente con valores
   stepper->set_parameter(L6474_TVAL, 400); // Corriente moderada
-  stepper->set_parameter(L6474_OCD_TH, L6474_OCD_TH_1500mA); // Umbral normal
+  stepper->set_parameter(L6474_OCD_TH, L6474_OCD_TH_1500mA);
   stepper->set_parameter(L6474_TON_MIN, 3);
   stepper->set_parameter(L6474_TOFF_MIN, 21);
   
-  // Configurar micropasos para precisión
+  // Micropasos altos para precisión
   stepper->set_step_mode(StepperMotor::STEP_MODE_1_16);
   div_per_step = 16;
   
-  // Configurar velocidades moderadas
   stepper->set_max_speed(200);
   stepper->set_acceleration(500);
   stepper->set_deceleration(500);
@@ -427,89 +424,75 @@ void configure_stepper_for_control() {
 }
 
 /******************************************************************************
-* SWING-UP ALGORITHM CON MOTOR STEPPER
+* SWING-UP ALGORITHM MODIFICADO - MOVIMIENTO ÚNICO
 */
 void reset_swing_up_variables() {
-  swing_cycle_count = 0;
   swing_start_time = millis();
   swing_phase_start_time = millis();
   upright_achieved = false;
-  swing_state = SWING_IMPULSE;
-  swing_direction = true;
-  current_impulse_angle = SWING_IMPULSE_ANGLE;
+  swing_state = SWING_FORWARD_PHASE;
   theta_max_achieved = 0.0;
+  
+  // Guardar posiciones iniciales
+  phi_start_position = phi;
+  theta_start_angle = theta;
 
   // CONFIGURAR MOTOR PARA MÁXIMA POTENCIA
   configure_stepper_for_swing_up();
 
-  Serial.println("=== INICIANDO SWING-UP CON MÁXIMA POTENCIA ===");
+  Serial.println("=== INICIANDO SWING-UP ÚNICO MODIFICADO ===");
   Serial.print("Ángulo inicial péndulo: "); Serial.print(theta, 1); Serial.println("°");
   Serial.print("Posición inicial stepper: "); Serial.print(phi, 1); Serial.println("°");
-  Serial.println("CONFIGURACIÓN OPTIMIZADA:");
-  Serial.print("- Corriente incrementada: 600 (era 300)");
-  Serial.println();
-  Serial.print("- Umbral sobrecorriente: 3750mA (era 750mA)");
-  Serial.println();
-  Serial.print("- Micropasos: 1/8 (era 1/16) para mayor torque");
-  Serial.println();
-  Serial.print("- Ángulo de impulso: ±"); Serial.print(current_impulse_angle, 1); Serial.println("° (era ±30°)");
-  Serial.print("- Velocidad impulso: "); Serial.print(SWING_IMPULSE_SPEED, 1); Serial.println(" steps/sec (era 500)");
+  Serial.println("SECUENCIA PLANIFICADA:");
+  Serial.print("1. Avance rápido: "); Serial.print(SWING_FORWARD_ANGLE, 1); 
+  Serial.print("° a "); Serial.print(SWING_FORWARD_SPEED, 0); Serial.println(" steps/sec");
+  Serial.print("2. Espera: "); Serial.print(SWING_WAIT_BEFORE_BACKWARD * 1000, 0); Serial.println(" ms");
+  Serial.print("3. Retroceso: "); Serial.print(SWING_BACKWARD_ANGLE, 1); 
+  Serial.print("° a "); Serial.print(SWING_BACKWARD_SPEED, 0); Serial.println(" steps/sec");
+  Serial.println("4. Monitoreo para verificar éxito");
 }
 
-void move_stepper_fast_swing_up(float deg, float speed) {
-  // Asegurar que estamos en modo swing-up
-  if (!swing_up_mode) {
-    configure_stepper_for_swing_up();
-  }
-
-  // Movimiento con máxima potencia
-  stepper->set_max_speed(speed);
-  stepper->set_acceleration(3000); // Aceleración máxima
-  move_stepper_by(deg);
-
-  Serial.print("Impulso POTENTE: "); Serial.print(deg, 1);
-  Serial.print("° a "); Serial.print(speed, 0); Serial.println(" steps/sec");
-}
-
-void run_swing_up() {
+void run_swing_up_modified() {
   float elapsed_time = (current_time - swing_start_time) / 1000.0;
   float phase_elapsed = (current_time - swing_phase_start_time) / 1000.0;
 
-  // Debug periódico más detallado
+  // Debug cada fase
   if (current_time - last_debug_print > DEBUG_INTERVAL) {
     Serial.print("SWING [T:"); Serial.print(elapsed_time, 1);
     Serial.print("s] θ:"); Serial.print(theta, 1);
+    Serial.print("° φ:"); Serial.print(phi, 1);
     Serial.print("° θ_max:"); Serial.print(theta_max_achieved, 1);
-    Serial.print("° Estado:");
+    Serial.print("° Fase:");
     switch(swing_state) {
-      case SWING_IMPULSE: Serial.print("IMPULSO"); break;
-      case SWING_WAIT: Serial.print("ESPERA"); break;
-      case SWING_DIRECTION_CHANGE: Serial.print("CAMBIO"); break;
+      case SWING_FORWARD_PHASE: Serial.print("AVANCE"); break;
+      case SWING_WAIT_PHASE: Serial.print("ESPERA"); break;
+      case SWING_BACKWARD_PHASE: Serial.print("RETROCESO"); break;
+      case SWING_MONITOR_PHASE: Serial.print("MONITOR"); break;
+      case SWING_COMPLETED: Serial.print("COMPLETADO"); break;
     }
-    Serial.print(" Dir:"); Serial.print(swing_direction ? "+" : "-");
-    Serial.print(" E:"); Serial.print(pendulum_energy, 2);
-    Serial.print(" Motor:"); Serial.print(stepper->get_device_state() == INACTIVE ? "PARADO" : "MOVIENDO");
+    Serial.print(" Motor:"); 
+    Serial.print(stepper->get_device_state() == INACTIVE ? "PARADO" : "MOVIENDO");
     Serial.println();
     last_debug_print = current_time;
   }
 
-  // VERIFICAR POSICIÓN INVERTIDA
+  // VERIFICAR POSICIÓN INVERTIDA EN CUALQUIER MOMENTO
   if (is_pendulum_upright()) {
     if (!upright_achieved) {
       stepper->hard_stop();
       phi_reference = phi;
       upright_achieved = true;
-      Serial.println("*** ¡POSICIÓN INVERTIDA ALCANZADA CON ÉXITO! ***");
-      Serial.print("Tiempo: "); Serial.print(elapsed_time, 1); Serial.println("s");
-      Serial.print("Ciclos necesarios: "); Serial.println(swing_cycle_count);
+      Serial.println("*** ¡POSICIÓN INVERTIDA ALCANZADA! ***");
+      Serial.print("Tiempo: "); Serial.print(elapsed_time, 2); Serial.println("s");
       Serial.print("Ángulo final: "); Serial.print(theta, 1); Serial.println("°");
+      Serial.print("Fase actual: "); Serial.println((int)swing_state);
     }
 
-    // TRANSICIÓN AL CONTROL CON CONFIGURACIÓN NORMAL
+    // TRANSICIÓN AL CONTROL
     system_state = STATE_CONTROL;
-    configure_stepper_for_control(); // CONFIGURAR PARA CONTROL DE PRECISIÓN
+    configure_stepper_for_control();
 
-    // Reset estados del controlador
+    // Reset controlador
     pid_integral = 0.0;
     pid_error_prev = 0.0;
     integral_error = 0.0;
@@ -518,21 +501,25 @@ void run_swing_up() {
     return;
   }
 
-  // Verificar timeout con mensaje más informativo
-  if (elapsed_time > SWING_MAX_DURATION || swing_cycle_count >= SWING_MAX_CYCLES) {
+  // Verificar timeout
+  if (elapsed_time > SWING_MAX_DURATION) {
     Serial.println("*** TIMEOUT EN SWING-UP - ANÁLISIS ***");
-    Serial.print("Tiempo transcurrido: "); Serial.print(elapsed_time, 1); Serial.println("s");
-    Serial.print("Ciclos ejecutados: "); Serial.println(swing_cycle_count);
-    Serial.print("Máximo ángulo alcanzado: "); Serial.print(theta_max_achieved, 1); Serial.println("°");
-    Serial.print("Energía final: "); Serial.println(pendulum_energy, 2);
-
-    if (theta_max_achieved < 90.0) {
-      Serial.println("DIAGNÓSTICO: Motor insuficiente potencia o carga excesiva");
-      Serial.println("SUGERENCIA: Verificar conexiones eléctricas y mecánicas");
-    } else if (theta_max_achieved < 150.0) {
-      Serial.println("DIAGNÓSTICO: Progreso moderado, posible mejora con más tiempo");
+    Serial.print("Tiempo total: "); Serial.print(elapsed_time, 1); Serial.println("s");
+    Serial.print("Ángulo máximo alcanzado: "); Serial.print(theta_max_achieved, 1); Serial.println("°");
+    Serial.print("Ángulo final: "); Serial.print(theta, 1); Serial.println("°");
+    Serial.print("Fase final: "); Serial.println((int)swing_state);
+    
+    if (theta_max_achieved > SWING_SUCCESS_THRESHOLD) {
+      Serial.println("RESULTADO: Swing-up exitoso pero sin estabilizar");
+      Serial.println("SUGERENCIA: Iniciar control manual");
     } else {
-      Serial.println("DIAGNÓSTICO: Muy cerca del objetivo, intentar control directo");
+      Serial.println("RESULTADO: Swing-up fallido");
+      Serial.println("SUGERENCIAS:");
+      Serial.print("- Reducir SWING_FORWARD_ANGLE (actualmente "); 
+      Serial.print(SWING_FORWARD_ANGLE); Serial.println("°)");
+      Serial.print("- Aumentar SWING_FORWARD_SPEED (actualmente "); 
+      Serial.print(SWING_FORWARD_SPEED); Serial.println(" steps/sec)");
+      Serial.println("- Verificar conexiones mecánicas y eléctricas");
     }
 
     stepper->hard_stop();
@@ -542,44 +529,81 @@ void run_swing_up() {
     return;
   }
 
-  // MÁQUINA DE ESTADOS MEJORADA
+  // MÁQUINA DE ESTADOS DEL SWING-UP MODIFICADO
   switch(swing_state) {
-    case SWING_IMPULSE:
+    case SWING_FORWARD_PHASE:
+      // Iniciar movimiento hacia adelante
       if (stepper->get_device_state() == INACTIVE) {
-        float impulse_angle = swing_direction ? current_impulse_angle : -current_impulse_angle;
-        move_stepper_fast_swing_up(impulse_angle, SWING_IMPULSE_SPEED);
-        swing_state = SWING_WAIT;
+        Serial.println("*** INICIANDO FASE DE AVANCE ***");
+        move_stepper_fast_precise(SWING_FORWARD_ANGLE, SWING_FORWARD_SPEED);
+        swing_phase_start_time = current_time;
+      }
+      
+      // Verificar si el movimiento ha terminado
+      if (stepper->get_device_state() == INACTIVE && phase_elapsed > 0.5) {
+        float motor_movement = phi - phi_start_position;
+        Serial.print("AVANCE COMPLETADO - Movimiento real: "); 
+        Serial.print(motor_movement, 1); Serial.println("°");
+        swing_state = SWING_WAIT_PHASE;
         swing_phase_start_time = current_time;
       }
       break;
 
-    case SWING_WAIT:
-      if (phase_elapsed >= SWING_WAIT_TIME) {
-        swing_state = SWING_DIRECTION_CHANGE;
+    case SWING_WAIT_PHASE:
+      // Esperar tiempo definido antes del retroceso
+      if (phase_elapsed >= SWING_WAIT_BEFORE_BACKWARD) {
+        Serial.println("*** INICIANDO FASE DE RETROCESO ***");
+        swing_state = SWING_BACKWARD_PHASE;
+        swing_phase_start_time = current_time;
       }
       break;
 
-    case SWING_DIRECTION_CHANGE:
-      swing_direction = !swing_direction;
-      swing_cycle_count++;
+    case SWING_BACKWARD_PHASE:
+      // Iniciar movimiento hacia atrás
+      if (stepper->get_device_state() == INACTIVE) {
+        move_stepper_fast_precise(-SWING_BACKWARD_ANGLE, SWING_BACKWARD_SPEED);
+      }
+      
+      // Verificar si el movimiento ha terminado
+      if (stepper->get_device_state() == INACTIVE && phase_elapsed > 0.5) {
+        Serial.println("RETROCESO COMPLETADO");
+        swing_state = SWING_MONITOR_PHASE;
+        swing_phase_start_time = current_time;
+      }
+      break;
 
-      // Ajuste dinámico MÁS AGRESIVO
-      if (swing_cycle_count % 3 == 0) { // Cada 3 ciclos (más frecuente)
-        if (theta_max_achieved < 80.0) {
-          // Péndulo no progresa - incremento mayor
-          current_impulse_angle = min(current_impulse_angle + 12.0, 100.0);
-          Serial.print("INCREMENTO AGRESIVO - Nuevo impulso: ");
-          Serial.print(current_impulse_angle, 1); Serial.println("°");
-        } else if (theta_max_achieved > 160.0) {
-          // Cerca del objetivo - movimientos finos
-          current_impulse_angle = max(current_impulse_angle - 4.0, 30.0);
-          Serial.print("AJUSTE FINO - Nuevo impulso: ");
-          Serial.print(current_impulse_angle, 1); Serial.println("°");
+    case SWING_MONITOR_PHASE:
+      // Monitorear por un tiempo adicional para ver si se alcanza la posición
+      if (phase_elapsed > 3.0) { // Monitorear por 3 segundos adicionales
+        Serial.println("*** FASE DE MONITOREO COMPLETADA ***");
+        Serial.print("Ángulo final del péndulo: "); Serial.print(theta, 1); Serial.println("°");
+        Serial.print("Ángulo máximo alcanzado: "); Serial.print(theta_max_achieved, 1); Serial.println("°");
+        
+        if (theta_max_achieved > SWING_SUCCESS_THRESHOLD) {
+          Serial.println("SWING-UP EXITOSO pero péndulo no estable en posición invertida");
+        } else {
+          Serial.println("SWING-UP NO EXITOSO - Ángulo insuficiente");
+        }
+        
+        swing_state = SWING_COMPLETED;
+      }
+      break;
+
+    case SWING_COMPLETED:
+      // Swing-up completado, mantener monitoreo pero no hacer más movimientos
+      // El sistema permanecerá aquí hasta timeout o logro de posición invertida
+      if (phase_elapsed > 2.0) {
+        // Si ha pasado suficiente tiempo sin lograr la posición, intentar control directo
+        if (theta_max_achieved > 120.0) { // Si se acercó bastante
+          Serial.println("Intentando transición a control directo...");
+          system_state = STATE_CONTROL;
+          configure_stepper_for_control();
+          phi_reference = phi;
+          pid_integral = 0.0;
+          pid_error_prev = 0.0;
+          integral_error = 0.0;
         }
       }
-
-      swing_state = SWING_IMPULSE;
-      swing_phase_start_time = current_time;
       break;
   }
 }
@@ -600,8 +624,13 @@ void run_control_loop() {
 
   switch (system_state) {
     case STATE_SWING_UP:
-      run_swing_up();
-      control_output = current_impulse_angle * (swing_direction ? 1.0 : -1.0); // Para monitoreo
+      run_swing_up_modified();
+      // Para monitoreo, reportar el estado actual
+      switch(swing_state) {
+        case SWING_FORWARD_PHASE: control_output = SWING_FORWARD_ANGLE; break;
+        case SWING_BACKWARD_PHASE: control_output = -SWING_BACKWARD_ANGLE; break;
+        default: control_output = 0.0; break;
+      }
       break;
 
     case STATE_CONTROL:
@@ -631,6 +660,22 @@ void run_control_loop() {
 }
 
 /******************************************************************************
+* Function to set swing-up parameters
+*/
+void set_swing_parameters(float forward_angle, float backward_angle, float forward_speed, float backward_speed) {
+  SWING_FORWARD_ANGLE = forward_angle;
+  SWING_BACKWARD_ANGLE = backward_angle;
+  SWING_FORWARD_SPEED = forward_speed;
+  SWING_BACKWARD_SPEED = backward_speed;
+  
+  Serial.println("*** PARÁMETROS DE SWING-UP ACTUALIZADOS ***");
+  Serial.print("Ángulo de avance: "); Serial.print(SWING_FORWARD_ANGLE, 1); Serial.println("°");
+  Serial.print("Ángulo de retroceso: "); Serial.print(SWING_BACKWARD_ANGLE, 1); Serial.println("°");
+  Serial.print("Velocidad de avance: "); Serial.print(SWING_FORWARD_SPEED, 0); Serial.println(" steps/sec");
+  Serial.print("Velocidad de retroceso: "); Serial.print(SWING_BACKWARD_SPEED, 0); Serial.println(" steps/sec");
+}
+
+/******************************************************************************
 * Setup and main loop
 */
 void setup() {
@@ -641,7 +686,7 @@ void setup() {
 
   // Initialize communication
   Serial.begin(BAUD_RATE);
-  Serial.println("=== SISTEMA DE CONTROL PÉNDULO - SWING-UP CON STEPPER ===");
+  Serial.println("=== SISTEMA DE CONTROL PÉNDULO - SWING-UP ÚNICO MODIFICADO ===");
   ctrl.init(Serial, CTRL_DEBUG);
 
   // Configure encoder
@@ -651,7 +696,7 @@ void setup() {
   Serial.println("Encoder del péndulo configurado (sensor únicamente)");
 
   // Initialize stepper
-  Serial.println("Inicializando motor stepper (swing-up y control)...");
+  Serial.println("Inicializando motor stepper...");
   stepper = new L6474(STP_FLAG_IRQ_PIN, STP_STBY_RST_PIN, STP_DIR_PIN, STP_PWM_PIN, STP_SPI_CS_PIN, &dev_spi);
   
   if (stepper->init(&stepper_config_control) != COMPONENT_OK) {
@@ -663,7 +708,7 @@ void setup() {
   stepper->enable_flag_irq();
   stepper->set_home();
 
-  // Configuración inicial moderada
+  // Configuración inicial para control
   configure_stepper_for_control();
   Serial.println("Motor stepper inicializado correctamente");
 
@@ -673,10 +718,20 @@ void setup() {
   last_debug_print = millis();
 
   Serial.println("=== SISTEMA COMPLETAMENTE INICIALIZADO ===");
-  Serial.println("Controlador de Péndulo Invertido - Swing-up con Stepper");
-  Serial.println("Encoder: Sensor de ángulo del péndulo");
-  Serial.println("Stepper: Swing-up (impulsos rápidos) y Control (movimientos finos)");
+  Serial.println("MÉTODO DE SWING-UP MODIFICADO:");
+  Serial.println("1. Movimiento único de avance rápido");
+  Serial.println("2. Breve pausa");
+  Serial.println("3. Retroceso calculado");
+  Serial.println("4. Monitoreo continuo del encoder del péndulo");
   Serial.println("=== ESPERANDO COMANDOS ===");
+  
+  // Mostrar parámetros actuales
+  Serial.println("PARÁMETROS ACTUALES:");
+  Serial.print("- Ángulo de avance: "); Serial.print(SWING_FORWARD_ANGLE, 1); Serial.println("°");
+  Serial.print("- Ángulo de retroceso: "); Serial.print(SWING_BACKWARD_ANGLE, 1); Serial.println("°");
+  Serial.print("- Velocidad de avance: "); Serial.print(SWING_FORWARD_SPEED, 0); Serial.println(" steps/sec");
+  Serial.print("- Velocidad de retroceso: "); Serial.print(SWING_BACKWARD_SPEED, 0); Serial.println(" steps/sec");
+  Serial.println("Para ajustar estos valores, usar comando CMD_SET_SWING_PARAMS (comando 9)");
 }
 
 void loop() {
@@ -747,25 +802,33 @@ void loop() {
         Serial.println("]");
         break;
 
+      case CMD_SET_SWING_PARAMS:
+        // Nuevo comando para ajustar parámetros de swing-up
+        // action[0] = forward_angle, action[1] = backward_angle
+        // action[2] = forward_speed, action[3] = backward_speed
+        if (action[0] > 0 && action[1] > 0 && action[2] > 0 && action[3] > 0) {
+          set_swing_parameters(action[0], action[1], action[2], action[3]);
+        } else {
+          Serial.println("Error: Todos los parámetros deben ser positivos");
+        }
+        break;
+
       case CMD_START_CONTROL:
         if (system_state == STATE_IDLE) {
           system_state = STATE_SWING_UP;
-          reset_swing_up_variables(); // Esto ahora configura máxima potencia
+          reset_swing_up_variables();
 
           // Reset estados del controlador
           pid_integral = 0.0;
           pid_error_prev = 0.0;
           integral_error = 0.0;
 
-          Serial.println("*** CONTROL INICIADO CON CONFIGURACIÓN OPTIMIZADA ***");
-          Serial.println("FASE 1: Swing-up con MÁXIMA POTENCIA del motor stepper");
-          Serial.println("FASE 2: Control automático de precisión al alcanzar 180°");
-          Serial.println("MEJORAS APLICADAS:");
-          Serial.println("- Corriente incrementada de 300 a 600");
-          Serial.println("- Umbral sobrecorriente de 750mA a 3750mA");
-          Serial.println("- Micropasos reducidos de 1/16 a 1/8");
-          Serial.println("- Velocidad incrementada de 500 a 1200 steps/sec");
-          Serial.println("- Ángulo de impulso de 30° a 45°");
+          Serial.println("*** CONTROL INICIADO - SWING-UP ÚNICO ***");
+          Serial.println("SECUENCIA:");
+          Serial.print("1. Avance de "); Serial.print(SWING_FORWARD_ANGLE, 1); Serial.println("° a máxima velocidad");
+          Serial.print("2. Pausa de "); Serial.print(SWING_WAIT_BEFORE_BACKWARD * 1000, 0); Serial.println(" ms");
+          Serial.print("3. Retroceso de "); Serial.print(SWING_BACKWARD_ANGLE, 1); Serial.println("°");
+          Serial.println("4. Monitoreo continuo hasta lograr posición invertida");
         } else {
           Serial.println("Error: Sistema no está en estado IDLE");
         }
@@ -773,7 +836,7 @@ void loop() {
 
       case CMD_STOP_CONTROL:
         system_state = STATE_IDLE;
-        stepper->hard_stop(); // Detener stepper inmediatamente
+        stepper->hard_stop();
         Serial.println("*** CONTROL DETENIDO ***");
         break;
 
@@ -790,13 +853,17 @@ void loop() {
     observation[1] = phi; // Rotor angle
     observation[2] = dtheta; // Pendulum velocity
     observation[3] = dphi; // Rotor velocity
-    observation[4] = (system_state == STATE_SWING_UP) ? current_impulse_angle : 0.0; // Swing impulse angle
-    observation[5] = (system_state == STATE_SWING_UP) ? pendulum_energy : integral_error; // Energy or control error
+    observation[4] = (float)swing_state; // Current swing state
+    observation[5] = theta_max_achieved; // Maximum angle achieved
 
     // Determine status
     int status = STATUS_OK;
     if (system_state == STATE_SWING_UP) {
-      status = STATUS_SWING_UP;
+      switch(swing_state) {
+        case SWING_FORWARD_PHASE: status = STATUS_SWING_FORWARD; break;
+        case SWING_BACKWARD_PHASE: status = STATUS_SWING_BACKWARD; break;
+        default: status = STATUS_SWING_UP; break;
+      }
     } else if (system_state == STATE_CONTROL) {
       status = is_pendulum_upright() ? STATUS_UPRIGHT_ACHIEVED : STATUS_CONTROL_ACTIVE;
     } else if (stepper->get_device_state() != INACTIVE) {
@@ -807,16 +874,18 @@ void loop() {
     ctrl.send_observation(status, millis(), false, observation, NUM_OBS);
   
   } else if (rx_code == ControlComms::ERROR) {
-    // Solo reportar errores críticos, no timeouts normales
-    if (millis() % 10000 == 0) { // Cada 10 segundos
-      Serial.println("Estado del sistema: Esperando comandos...");
+    // Solo reportar errores críticos ocasionalmente
+    static unsigned long last_error_report = 0;
+    if (millis() - last_error_report > 10000) { // Cada 10 segundos
+      Serial.println("Sistema en espera de comandos...");
+      last_error_report = millis();
     }
   }
 
-  // LED de estado para debugging visual
+  // LED de estado
   static unsigned long last_led_update = 0;
   if (millis() - last_led_update > 1000) {
-    digitalWrite(LED_PIN, !digitalRead(LED_PIN)); // Toggle LED cada segundo
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
     last_led_update = millis();
   }
 }
