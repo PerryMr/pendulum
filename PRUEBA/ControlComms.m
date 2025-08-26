@@ -1,13 +1,12 @@
 classdef ControlComms < handle
-    %CONTROLCOMMS Clase para comunicación serial con Arduino
+    %CONTROLCOMMS Clase para comunicación serial con Arduino - VERSIÓN SIN DEBUG
     %   Esta clase maneja la comunicación bidireccional con el controlador
     %   del péndulo invertido mediante protocolo JSON sobre puerto serial
     %
-    %   VERSIÓN ACTUALIZADA v1.1:
-    %   - Agregados comandos para control directo sin swing-up
-    %   - CMD_START_DIRECT_CONTROL: Control inmediato
-    %   - CMD_SET_SWING_MODE: Habilitar/deshabilitar swing-up
-    %   - STATUS_DIRECT_CONTROL: Nuevo estado de sistema
+    %   VERSIÓN ACTUALIZADA v1.2:
+    %   - Filtrado inteligente de mensajes de debug del Arduino
+    %   - Eliminados completamente los mensajes "Respuesta inválida"
+    %   - Manejo robusto de comunicación mixta (JSON + texto debug)
     
     properties (Access = private)
         serialObj           % Objeto puerto serial
@@ -184,7 +183,7 @@ classdef ControlComms < handle
         end
         
         function result = step(obj, command, action)
-            %STEP Envía comando y acciones, espera observación
+            %STEP Envía comando y acciones, espera observación - VERSIÓN MEJORADA
             %   command - Comando entero a enviar
             %   action - Vector de acciones (números flotantes)
             %   Retorna struct con campos: status, timestamp, terminated, observation
@@ -211,15 +210,7 @@ classdef ControlComms < handle
             
             try
                 % Limpiar buffer de entrada antes de enviar
-                if exist('serialport', 'file') == 2
-                    if obj.serialObj.NumBytesAvailable > 0
-                        flush(obj.serialObj);
-                    end
-                else
-                    while obj.serialObj.BytesAvailable > 0
-                        fread(obj.serialObj, obj.serialObj.BytesAvailable);
-                    end
-                end
+                obj.clearInputBuffer();
                 
                 % Enviar mensaje
                 if exist('serialport', 'file') == 2
@@ -230,42 +221,11 @@ classdef ControlComms < handle
                     fprintf(obj.serialObj, '%s\n', msg);
                 end
                 
-                % Esperar respuesta con timeout mejorado
-                response = '';
-                attempts = 0;
-                max_attempts = 10;
+                % NUEVO: Esperar respuesta JSON con filtrado inteligente
+                response = obj.waitForJSONResponse();
                 
-                while isempty(response) && attempts < max_attempts
-                    try
-                        if exist('serialport', 'file') == 2
-                            response = readline(obj.serialObj);
-                            response = char(response);
-                        else
-                            response = fgetl(obj.serialObj);
-                        end
-                        
-                        if isempty(response) || (ischar(response) && strcmp(response, ''))
-                            pause(0.01); % Breve pausa antes de reintentar
-                            attempts = attempts + 1;
-                        end
-                    catch
-                        attempts = attempts + 1;
-                        pause(0.01);
-                    end
-                end
-                
-                if isempty(response) || attempts >= max_attempts
-                    if obj.debugLevel >= obj.DEBUG_ERROR
-                        fprintf('Timeout: No se recibió respuesta del Arduino\n');
-                    end
-                    return;
-                end
-                
-                % Validar que la respuesta sea JSON válido
-                if ~ischar(response) || isempty(strfind(response, '{'))
-                    if obj.debugLevel >= obj.DEBUG_ERROR
-                        fprintf('Respuesta inválida (no JSON): %s\n', response);
-                    end
+                if isempty(response)
+                    % Sin error verbose, solo retornar vacío
                     return;
                 end
                 
@@ -301,11 +261,9 @@ classdef ControlComms < handle
                 end
                 
             catch ME
+                % Solo reportar errores críticos de comunicación
                 if obj.debugLevel >= obj.DEBUG_ERROR
-                    fprintf('Error en comunicación: %s\n', ME.message);
-                    if exist('response', 'var') && ~isempty(response)
-                        fprintf('Respuesta recibida: %s\n', response);
-                    end
+                    fprintf('Error crítico en comunicación: %s\n', ME.message);
                 end
             end
         end
@@ -417,7 +375,7 @@ classdef ControlComms < handle
             %PRINTSYSTEMINFO Imprime información del sistema de comandos
             
             fprintf('=== SISTEMA DE CONTROL PÉNDULO INVERTIDO ===\n');
-            fprintf('ControlComms v1.1 - Con soporte para control directo\n\n');
+            fprintf('ControlComms v1.2 - Sin mensajes de debug molestos\n\n');
             
             fprintf('COMANDOS DISPONIBLES:\n');
             fprintf('  %d - SET_HOME: Establecer posición home\n', obj.CMD_SET_HOME);
@@ -443,18 +401,107 @@ classdef ControlComms < handle
             fprintf('  %d - SWING_BACKWARD: Swing-up fase retroceso\n', obj.STATUS_SWING_BACKWARD);
             fprintf('  %d - DIRECT_CONTROL: Control directo activo\n', obj.STATUS_DIRECT_CONTROL);
             
-            fprintf('\nMODOS DE OPERACIÓN:\n');
-            fprintf('1. SWING-UP + CONTROL:\n');
-            fprintf('   - Usar setSwingMode(true) + startSwingUpControl()\n');
-            fprintf('   - Ejecuta swing-up automático seguido de control\n');
-            fprintf('2. CONTROL DIRECTO:\n');
-            fprintf('   - Usar startDirectControl() directamente\n');
-            fprintf('   - Para péndulos ya cerca de posición invertida\n');
-            fprintf('3. MODO HÍBRIDO:\n');
-            fprintf('   - Usar setSwingMode(false) + startSwingUpControl()\n');
-            fprintf('   - CMD_START_CONTROL actuará como control directo\n');
-            
             fprintf('\n=== FIN INFORMACIÓN SISTEMA ===\n');
+        end
+    end
+    
+    methods (Access = private)
+        function clearInputBuffer(obj)
+            %CLEARINPUTBUFFER Limpia el buffer de entrada
+            
+            try
+                if exist('serialport', 'file') == 2
+                    if obj.serialObj.NumBytesAvailable > 0
+                        flush(obj.serialObj);
+                    end
+                else
+                    while obj.serialObj.BytesAvailable > 0
+                        fread(obj.serialObj, obj.serialObj.BytesAvailable);
+                    end
+                end
+            catch
+                % Ignorar errores de limpieza
+            end
+        end
+        
+        function response = waitForJSONResponse(obj)
+            %WAITFORJSONRESPONSE Espera una respuesta JSON válida, ignorando mensajes de debug
+            %   Filtra automáticamente mensajes de texto del Arduino
+            %   Retorna string JSON válido o vacío si hay timeout
+            
+            response = '';
+            attempts = 0;
+            max_attempts = 20; % Aumentar intentos para manejar múltiples líneas de debug
+            
+            % Lista de palabras clave que indican mensajes de debug del Arduino
+            debug_keywords = {'Stepper', 'Controlador', 'Home', 'establecido', ...
+                             'seleccionado', 'configurado', 'Sistema', 'SWING', ...
+                             'CONTROL', 'Motor', 'Parámetros', 'Ganancias', ...
+                             'Ángulo', 'Velocidad', 'Modo', 'position', 'set', ...
+                             '***', '===', 'INICIANDO', 'COMPLETADO', 'ERROR', ...
+                             'Movimiento', 'preciso', 'steps/sec', 'CONFIGURANDO', ...
+                             'MÁXIMA', 'POTENCIA', 'PRECISIÓN', 'listo', 'Aceleración'};
+            
+            while attempts < max_attempts
+                try
+                    if exist('serialport', 'file') == 2
+                        temp_response = readline(obj.serialObj);
+                        if ~isempty(temp_response)
+                            temp_response = char(temp_response);
+                        end
+                    else
+                        temp_response = fgetl(obj.serialObj);
+                    end
+                    
+                    if isempty(temp_response) || (ischar(temp_response) && strcmp(temp_response, ''))
+                        pause(0.01); % Breve pausa antes de reintentar
+                        attempts = attempts + 1;
+                        continue;
+                    end
+                    
+                    % Verificar si es JSON válido (debe empezar con '{')
+                    if ischar(temp_response) && ~isempty(temp_response) && temp_response(1) == '{'
+                        response = temp_response;
+                        return; % ¡Encontramos JSON válido!
+                    end
+                    
+                    % Si llegamos aquí, es un mensaje de debug del Arduino
+                    % Verificar si contiene palabras clave de debug
+                    is_debug_message = false;
+                    for i = 1:length(debug_keywords)
+                        if contains(temp_response, debug_keywords{i})
+                            is_debug_message = true;
+                            break;
+                        end
+                    end
+                    
+                    % Si es claramente un mensaje de debug, lo ignoramos silenciosamente
+                    if is_debug_message
+                        % No imprimir nada, solo continuar buscando JSON
+                        attempts = attempts + 1;
+                        continue;
+                    end
+                    
+                    % Si no es JSON ni un mensaje de debug conocido, reportar solo si es nivel INFO
+                    if obj.debugLevel >= obj.DEBUG_INFO
+                        fprintf('Mensaje desconocido del Arduino: %s\n', temp_response);
+                    end
+                    
+                    attempts = attempts + 1;
+                    
+                catch
+                    attempts = attempts + 1;
+                    pause(0.01);
+                end
+            end
+            
+            % Si llegamos aquí, no encontramos JSON válido en el tiempo permitido
+            % No reportar error a menos que sea nivel DEBUG_ERROR
+            if obj.debugLevel >= obj.DEBUG_ERROR && attempts >= max_attempts
+                fprintf('Timeout: No se recibió respuesta JSON válida del Arduino\n');
+            end
+            
+            response = ''; % Retornar vacío en caso de timeout
         end
     end
 end

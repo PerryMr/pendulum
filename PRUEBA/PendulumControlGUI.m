@@ -1,27 +1,4 @@
-set(gui_data.swing_status, 'String', sprintf('Estado: Control %s %s', controller_name{gui_data.current_controller + 1}, control_mode), 'ForegroundColor', [0, 0, 0.8]);
-            set(gui_data.phase_display, 'String', 'Fase: Estabilizando');
-            set(gui_data.energy_display, 'String', sprintf('Error: %.3f', energy));
-            
-        case gui_data.STATUS_DIRECT_CONTROL
-            % NUEVO: Manejo del estado de control directo
-            controller_name = {'PID', 'LQR'};
-            set(gui_data.swing_status, 'String', sprintf('Estado: Control %s DIRECTO', controller_name{gui_data.current_controller + 1}), 'ForegroundColor', [0.8, 0.4, 0]);
-            set(gui_data.phase_display, 'String', 'Fase: Control Directo');
-            set(gui_data.energy_display, 'String', sprintf('Error: %.3f', energy));
-            
-        case gui_data.STATUS_UPRIGHT_ACHIEVED
-            if ~gui_data.upright_achieved
-                gui_data.upright_achieved = true;
-                fprintf('*** ¡PÉNDULO INVERTIDO LOGRADO! ***\n');
-                fprintf('Tiempo: %.1f s\n', current_time);
-                fprintf('Ángulo máximo alcanzado: %.1f°\n', gui_data.max_theta_achieved);
-                fprintf('Modo: %s\n', gui_data.swing_enabled ? 'Con Swing-up' : 'Control Directo');
-            end
-            set(gui_data.swing_status, 'String', '🎉 ¡PÉNDULO INVERTIDO LOGRADO!', 'ForegroundColor', [0, 0.8, 0]);
-            set(gui_data.phase_display, 'String', 'Fase: ¡Éxito!');
-            set(gui_data.energy_display, 'String', sprintf('Error: %.3f', energy));
-    end
-endfunction PendulumControlGUI_SwingUp()
+function PendulumControlGUI_SwingUp()
     %PENDULUMCONTROLGUI_SWINGUP GUI actualizada para swing-up con motor stepper
     %   Versión sincronizada con pendulum-controller-stepper-swingup.ino
     %   Incluye monitoreo del swing-up y transición automática al control
@@ -72,13 +49,7 @@ endfunction PendulumControlGUI_SwingUp()
     gui_data.last_successful_read = tic;
     gui_data.sample_counter = 0;
     
-    % Estados del sistema (sincronizados con Arduino)
-    gui_data.STATE_IDLE = 0;
-    gui_data.STATE_SWING_UP = 1;
-    gui_data.STATE_CONTROL = 2;
-    gui_data.STATE_STOPPED = 3;
-    
-    % Status codes (sincronizados con Arduino) - ACTUALIZADOS
+    % Estados del sistema (sincronizados con ControlComms)
     gui_data.STATUS_OK = 0;
     gui_data.STATUS_STP_MOVING = 1;
     gui_data.STATUS_SWING_UP = 2;
@@ -144,6 +115,7 @@ end
 function create_gui_layout()
     global gui_data;
     gui_data.y_offset = 100;
+    
     %% Panel de parámetros (izquierda)
     gui_data.param_panel = uipanel('Parent', gui_data.fig, ...
                                   'Title', 'Parámetros y Control', ...
@@ -165,8 +137,6 @@ function create_gui_layout()
                                  'FontSize', 10, ...
                                  'FontWeight', 'bold');
 end
-
-
 
 function create_connection_controls()
     global gui_data;
@@ -504,15 +474,15 @@ function initialize_plots()
     xlabel(gui_data.ax1, 'Muestra');
     ylabel(gui_data.ax1, 'Estado');
     grid(gui_data.ax1, 'on');
-    ylim(gui_data.ax1, [-0.5, 4.5]);
-    set(gui_data.ax1, 'YTick', 0:4, 'YTickLabel', {'Idle', 'Swing', 'Control', 'Stop', 'Upright'});
+    ylim(gui_data.ax1, [-0.5, 7.5]); % Ajustado para incluir todos los estados
+    set(gui_data.ax1, 'YTick', 0:7, 'YTickLabel', {'OK', 'Moving', 'Swing', 'Control', 'Upright', 'SwFwd', 'SwBwd', 'Direct'});
     xlim(gui_data.ax1, [0, 50]); % Límite inicial
     
-    % 2. Ángulo del péndulo con setpoint - MEJORADO
+    % 2. Ángulo del péndulo con setpoint
     gui_data.ax2 = subplot(3, 2, 2, 'Parent', gui_data.plot_panel);
     hold(gui_data.ax2, 'on');
-    gui_data.line2a = plot(gui_data.ax2, NaN, NaN, 'r-', 'LineWidth', 2, 'DisplayName', 'Setpoint (180°)');
-    gui_data.line2b = plot(gui_data.ax2, NaN, NaN, 'k', 'DisplayName', 'Ángulo Péndulo');
+    gui_data.line2a = plot(gui_data.ax2, NaN, NaN, 'r--', 'LineWidth', 2, 'DisplayName', 'Setpoint (180°)');
+    gui_data.line2b = plot(gui_data.ax2, NaN, NaN, 'b-', 'LineWidth', 1.5, 'DisplayName', 'Ángulo Péndulo');
     title(gui_data.ax2, 'Ángulo del Péndulo', 'FontSize', 10, 'FontWeight', 'bold');
     xlabel(gui_data.ax2, 'Muestra');
     ylabel(gui_data.ax2, 'Grados');
@@ -522,20 +492,20 @@ function initialize_plots()
     xlim(gui_data.ax2, [0, 50]);
     hold(gui_data.ax2, 'off');
     
-    % 3. Ángulo del rotor (stepper) - MEJORADO
+    % 3. Ángulo del rotor (stepper)
     gui_data.ax3 = subplot(3, 2, 3, 'Parent', gui_data.plot_panel);
-    gui_data.line3 = plot(gui_data.ax3, NaN, NaN, 'k');
+    gui_data.line3 = plot(gui_data.ax3, NaN, NaN, 'g-', 'LineWidth', 1.5);
     title(gui_data.ax3, 'Ángulo Rotor (Stepper)', 'FontSize', 10, 'FontWeight', 'bold');
     xlabel(gui_data.ax3, 'Muestra');
     ylabel(gui_data.ax3, 'Grados');
     grid(gui_data.ax3, 'on');
     xlim(gui_data.ax3, [0, 50]);
     
-    % 4. Velocidades angulares - MEJORADO
+    % 4. Velocidades angulares
     gui_data.ax4 = subplot(3, 2, 4, 'Parent', gui_data.plot_panel);
     hold(gui_data.ax4, 'on');
-    gui_data.line4a = plot(gui_data.ax4, NaN, NaN,  'k', 'DisplayName', 'ω péndulo');
-    gui_data.line4b = plot(gui_data.ax4, NaN, NaN, 'r-', 'DisplayName', 'ω rotor');
+    gui_data.line4a = plot(gui_data.ax4, NaN, NaN, 'b-', 'DisplayName', 'ω péndulo');
+    gui_data.line4b = plot(gui_data.ax4, NaN, NaN, 'g-', 'DisplayName', 'ω rotor');
     title(gui_data.ax4, 'Velocidades Angulares', 'FontSize', 10, 'FontWeight', 'bold');
     xlabel(gui_data.ax4, 'Muestra');
     ylabel(gui_data.ax4, 'Grados/s');
@@ -544,9 +514,9 @@ function initialize_plots()
     xlim(gui_data.ax4, [0, 50]);
     hold(gui_data.ax4, 'off');
     
-    % 5. Impulso de swing-up - MEJORADO CON MEJOR VISUALIZACIÓN
+    % 5. Impulso de swing-up
     gui_data.ax5 = subplot(3, 2, 5, 'Parent', gui_data.plot_panel);
-    gui_data.line5 = plot(gui_data.ax5, NaN, NaN, 'k');
+    gui_data.line5 = plot(gui_data.ax5, NaN, NaN, 'm-', 'LineWidth', 1.5);
     title(gui_data.ax5, 'Impulso Swing-up', 'FontSize', 10, 'FontWeight', 'bold');
     xlabel(gui_data.ax5, 'Muestra');
     ylabel(gui_data.ax5, 'Ángulo Impulso (°)');
@@ -554,16 +524,16 @@ function initialize_plots()
     xlim(gui_data.ax5, [0, 50]);
     ylim(gui_data.ax5, [-80, 80]); % Rango inicial más amplio
     
-    % 6. Energía/Error - MEJORADO
+    % 6. Energía/Error
     gui_data.ax6 = subplot(3, 2, 6, 'Parent', gui_data.plot_panel);
-    gui_data.line6 = plot(gui_data.ax6, NaN, NaN, 'k');
+    gui_data.line6 = plot(gui_data.ax6, NaN, NaN, 'r-', 'LineWidth', 1.5);
     title(gui_data.ax6, 'Energía/Error Integral', 'FontSize', 10, 'FontWeight', 'bold');
     xlabel(gui_data.ax6, 'Muestra');
     ylabel(gui_data.ax6, 'Valor');
     grid(gui_data.ax6, 'on');
     xlim(gui_data.ax6, [0, 50]);
     
-    % CONFIGURAR TODAS LAS GRÁFICAS PARA MEJOR RENDIMIENTO
+    % Configurar todas las gráficas para mejor rendimiento
     all_axes = [gui_data.ax1, gui_data.ax2, gui_data.ax3, gui_data.ax4, gui_data.ax5, gui_data.ax6];
     
     for i = 1:length(all_axes)
@@ -582,47 +552,7 @@ function initialize_plots()
     fprintf('Gráficas inicializadas con configuración optimizada\n');
 end
 
-% FUNCIÓN ADICIONAL: Verificar y corregir datos antes de graficar
-function [x_data, y_data] = validate_plot_data(x_raw, y_raw)
-    % Validar que los datos sean apropiados para graficar
-    
-    if isempty(x_raw) || isempty(y_raw)
-        x_data = NaN;
-        y_data = NaN;
-        return;
-    end
-    
-    % Asegurar que sean vectores fila
-    x_raw = x_raw(:)';
-    y_raw = y_raw(:)';
-    
-    % Verificar que tengan la misma longitud
-    if length(x_raw) ~= length(y_raw)
-        min_len = min(length(x_raw), length(y_raw));
-        x_raw = x_raw(1:min_len);
-        y_raw = y_raw(1:min_len);
-    end
-    
-    % Remover valores NaN o Inf
-    valid_idx = isfinite(x_raw) & isfinite(y_raw);
-    
-    if ~any(valid_idx)
-        x_data = NaN;
-        y_data = NaN;
-        return;
-    end
-    
-    x_data = x_raw(valid_idx);
-    y_data = y_raw(valid_idx);
-    
-    % Asegurar que tengamos al menos 2 puntos para graficar
-    if length(x_data) < 2
-        x_data = [x_data, x_data(end)+1];
-        y_data = [y_data, y_data(end)];
-    end
-end
-
-%% NUEVA FUNCIÓN: Toggle Swing Up
+%% FUNCIÓN TOGGLE SWING UP
 function toggle_swing_up(~, ~)
     global gui_data;
     
@@ -661,7 +591,7 @@ function toggle_swing_up(~, ~)
     end
 end
 
-%% Callbacks principales
+%% CALLBACKS PRINCIPALES
 
 function select_controller(controller_type)
     global gui_data;
@@ -679,7 +609,7 @@ function select_controller(controller_type)
         fprintf('Controlador LQR seleccionado\n');
     end
     
-    % Enviar al Arduino
+    % Enviar al Arduino usando ControlComms
     if gui_data.is_connected
         try
             controller_action = [controller_type, 0, 0, 0, 0, 0];
@@ -698,7 +628,7 @@ function connect_callback(~, ~)
         port = get(gui_data.port_edit, 'String');
         
         if isempty(gui_data.ctrl)
-            gui_data.ctrl = ControlComms(2.0, 0); % timeout=2s, debug=none
+            gui_data.ctrl = ControlComms(2.0, ControlComms.DEBUG_WARN); % Cambiar a DEBUG_WARN
         end
         
         status = gui_data.ctrl.connect(port, 500000); % Baudrate del Arduino
@@ -712,7 +642,7 @@ function connect_callback(~, ~)
             set(gui_data.status_text, 'String', 'Estado: Conectado - Sistema Listo', 'ForegroundColor', [0, 0.6, 0]);
             set([gui_data.start_btn, gui_data.stop_btn, gui_data.home_btn, gui_data.save_btn, gui_data.step_mode_btn], 'Enable', 'on');
             
-            % Configuración inicial sincronizada con Arduino
+            % Configuración inicial sincronizada con Arduino usando ControlComms
             try
                 base_action = [0, 0, 0, 0, 0, 0];
                 
@@ -755,7 +685,7 @@ function refresh_ports_callback(~, ~)
     global gui_data;
     
     try
-        temp_ctrl = ControlComms(1.0, 0);
+        temp_ctrl = ControlComms(1.0, ControlComms.DEBUG_NONE);
         available_ports = temp_ctrl.getSerialList();
         
         if ~isempty(available_ports)
@@ -800,7 +730,7 @@ function calculate_lqr_gains(~, ~)
         k_str = sprintf('K = [%.3f, %.3f, %.3f, %.3f, %.3f]', gui_data.lqr_gains);
         set(gui_data.k_display, 'String', k_str);
         
-        % Enviar al Arduino
+        % Enviar al Arduino usando ControlComms
         if gui_data.is_connected
             try
                 lqr_action = [gui_data.lqr_gains, 0];
@@ -867,25 +797,32 @@ function start_control(~, ~)
     gui_data.ctrl.step(gui_data.ctrl.CMD_SELECT_CONTROLLER, controller_action);
     pause(0.1);
     
-    % USAR LOS NUEVOS COMANDOS SEGÚN EL ESTADO DEL SWING-UP
+    % USAR LOS COMANDOS CORRECTOS DE CONTROLCOMMS SEGÚN EL ESTADO DEL SWING-UP
     if gui_data.swing_enabled
-        % Configurar Arduino para modo swing-up y luego iniciar
-        swing_mode_action = [1, 0, 0, 0, 0, 0]; % 1 = habilitar swing-up
-        gui_data.ctrl.step(gui_data.ctrl.CMD_SET_SWING_MODE, swing_mode_action);
+        % Configurar Arduino para modo swing-up y luego iniciar usando ControlComms
+        gui_data.ctrl.setSwingMode(true);
         pause(0.1);
         
-        % Iniciar con swing-up
-        gui_data.ctrl.step(gui_data.ctrl.CMD_START_CONTROL, base_action);
+        % Iniciar con swing-up usando el método de ControlComms
+        result = gui_data.ctrl.startSwingUpControl();
+        
         set(gui_data.swing_status, 'String', 'Estado: Iniciando Swing-up', 'ForegroundColor', [0, 0, 0.8]);
         fprintf('=== INICIANDO CON SWING-UP ===\n');
-        fprintf('Comando enviado: SET_SWING_MODE(enabled) + START_CONTROL\n');
+        fprintf('Usando: setSwingMode(true) + startSwingUpControl()\n');
     else
-        % Usar comando de control directo
-        gui_data.ctrl.step(gui_data.ctrl.CMD_START_DIRECT_CONTROL, base_action);
+        % Usar comando de control directo usando ControlComms
+        result = gui_data.ctrl.startDirectControl();
+        
         set(gui_data.swing_status, 'String', 'Estado: Iniciando Control Directo', 'ForegroundColor', [0.8, 0.5, 0]);
         fprintf('=== INICIANDO CONTROL DIRECTO (SIN SWING-UP) ===\n');
-        fprintf('Comando enviado: START_DIRECT_CONTROL\n');
+        fprintf('Usando: startDirectControl()\n');
         fprintf('NOTA: Asegúrese de que el péndulo esté cerca de la posición invertida\n');
+    end
+    
+    % Verificar que el comando se envió correctamente
+    if isempty(result)
+        msgbox('Error al enviar comando de inicio. Verifique la conexión.', 'Error', 'error');
+        return;
     end
     
     % Actualizar estado
@@ -897,7 +834,11 @@ function start_control(~, ~)
     start(gui_data.timer);
     
     controller_name = {'PID', 'LQR'};
-    mode_str = gui_data.swing_enabled ? 'Swing-up + Control' : 'Control Directo';
+    if gui_data.swing_enabled
+        mode_str = 'Swing-up + Control';
+    else
+        mode_str = 'Control Directo';
+    end
     fprintf('Controlador: %s | Modo: %s\n', controller_name{gui_data.current_controller + 1}, mode_str);
 end
 
@@ -978,7 +919,11 @@ function save_data(~, ~)
         % Guardar archivo
         timestamp = datestr(now, 'yyyymmdd_HHMMSS');
         controller_name = {'PID', 'LQR'};
-        swing_mode = gui_data.swing_enabled ? 'SwingUp' : 'Direct';
+        if gui_data.swing_enabled
+            swing_mode = 'SwingUp';
+        else
+            swing_mode = 'Direct';
+        end
         filename = sprintf('pendulum_%s_%s_%s.mat', swing_mode, controller_name{gui_data.current_controller + 1}, timestamp);
         
         save(filename, 'data_struct');
@@ -1008,7 +953,7 @@ function update_display(~, ~)
     try
         base_action = [0, 0, 0, 0, 0, 0];
         
-        % Usar comando que no interfiera con el control
+        % Usar comando que no interfiera con el control (MOVE_BY con acción cero)
         resp = gui_data.ctrl.step(gui_data.ctrl.CMD_MOVE_BY, base_action);
         
         if ~isempty(resp) && isstruct(resp) && isfield(resp, 'observation') && isfield(resp, 'timestamp')
@@ -1039,24 +984,6 @@ function update_display(~, ~)
                 gui_data.energy_error_data(end+1) = obs(6);  % Energía o error
                 gui_data.status_data(end+1) = status;
                 
-                % VERIFICAR SINCRONIZACIÓN de arrays
-                lengths = [length(gui_data.sample_data), length(gui_data.time_data), ...
-                          length(gui_data.theta_data), length(gui_data.phi_data), ...
-                          length(gui_data.dtheta_data), length(gui_data.dphi_data), ...
-                          length(gui_data.swing_impulse_data), length(gui_data.energy_error_data), ...
-                          length(gui_data.status_data)];
-                
-                if ~all(lengths == lengths(1))
-                    fprintf('ADVERTENCIA: Arrays desincronizados: %s\n', mat2str(lengths));
-                    % Truncar todos al tamaño mínimo
-                    min_length = min(lengths);
-                    fields = {'sample_data', 'time_data', 'theta_data', 'phi_data', ...
-                             'dtheta_data', 'dphi_data', 'swing_impulse_data', 'energy_error_data', 'status_data'};
-                    for i = 1:length(fields)
-                        gui_data.(fields{i}) = gui_data.(fields{i})(1:min_length);
-                    end
-                end
-                
                 % Actualizar información de swing-up
                 update_swing_info(obs, status, current_time);
                 
@@ -1072,11 +999,16 @@ function update_display(~, ~)
                 % Actualizar gráficas
                 update_plots();
                 
-                % Debug cada 25 muestras (más frecuente para detectar problemas)
+                % Debug cada 25 muestras
                 if mod(gui_data.sample_counter, 25) == 0
-                    swing_mode_str = gui_data.swing_enabled ? 'Swing' : 'Direct';
-                    fprintf('Muestra %d [%s]: θ=%.1f°, φ=%.1f°, Status=%d\n', ...
-                        gui_data.sample_counter, swing_mode_str, obs(1), obs(2), status);
+                    if gui_data.swing_enabled
+                        swing_mode_str = 'Swing';
+                    else
+                        swing_mode_str = 'Direct';
+                    end
+                    status_str = gui_data.ctrl.getStatusString(status);
+                    fprintf('Muestra %d [%s]: θ=%.1f°, φ=%.1f°, Status=%s\n', ...
+                        gui_data.sample_counter, swing_mode_str, obs(1), obs(2), status_str);
                 end
                 
             else
@@ -1091,9 +1023,9 @@ function update_display(~, ~)
         end
         
     catch ME
-        % Solo reportar errores críticos, pero más información
-        if toc(gui_data.last_successful_read) > 2 % Reducir timeout
-            fprintf('Error comunicación: %s (línea %d)\n', ME.message, ME.stack(1).line);
+        % Solo reportar errores críticos
+        if toc(gui_data.last_successful_read) > 2
+            fprintf('Error comunicación: %s\n', ME.message);
             gui_data.last_successful_read = tic;
         end
     end
@@ -1118,7 +1050,7 @@ function update_swing_info(obs, status, current_time)
     set(gui_data.time_display, 'String', sprintf('Tiempo: %.1f s', current_time));
     set(gui_data.max_angle_display, 'String', sprintf('Máx θ: %.1f°', gui_data.max_theta_achieved));
     
-    % Actualizar según estado
+    % Actualizar según estado usando los valores de ControlComms
     switch status
         case gui_data.STATUS_OK
             if gui_data.swing_enabled
@@ -1151,9 +1083,20 @@ function update_swing_info(obs, status, current_time)
             
         case gui_data.STATUS_CONTROL_ACTIVE
             controller_name = {'PID', 'LQR'};
-            control_mode = gui_data.swing_enabled ? 'post-Swing' : 'Directo';
+            if gui_data.swing_enabled
+                control_mode = 'post-Swing';
+            else
+                control_mode = 'Directo';
+            end
             set(gui_data.swing_status, 'String', sprintf('Estado: Control %s %s', controller_name{gui_data.current_controller + 1}, control_mode), 'ForegroundColor', [0, 0, 0.8]);
             set(gui_data.phase_display, 'String', 'Fase: Estabilizando');
+            set(gui_data.energy_display, 'String', sprintf('Error: %.3f', energy));
+            
+        case gui_data.STATUS_DIRECT_CONTROL
+            % NUEVO: Manejo del estado de control directo
+            controller_name = {'PID', 'LQR'};
+            set(gui_data.swing_status, 'String', sprintf('Estado: Control %s DIRECTO', controller_name{gui_data.current_controller + 1}), 'ForegroundColor', [0.8, 0.4, 0]);
+            set(gui_data.phase_display, 'String', 'Fase: Control Directo');
             set(gui_data.energy_display, 'String', sprintf('Error: %.3f', energy));
             
         case gui_data.STATUS_UPRIGHT_ACHIEVED
@@ -1162,11 +1105,31 @@ function update_swing_info(obs, status, current_time)
                 fprintf('*** ¡PÉNDULO INVERTIDO LOGRADO! ***\n');
                 fprintf('Tiempo: %.1f s\n', current_time);
                 fprintf('Ángulo máximo alcanzado: %.1f°\n', gui_data.max_theta_achieved);
-                fprintf('Modo: %s\n', gui_data.swing_enabled ? 'Con Swing-up' : 'Control Directo');
+                if gui_data.swing_enabled
+                    fprintf('Modo: Con Swing-up\n');
+                else
+                    fprintf('Modo: Control Directo\n');
+                end
             end
             set(gui_data.swing_status, 'String', '🎉 ¡PÉNDULO INVERTIDO LOGRADO!', 'ForegroundColor', [0, 0.8, 0]);
             set(gui_data.phase_display, 'String', 'Fase: ¡Éxito!');
             set(gui_data.energy_display, 'String', sprintf('Error: %.3f', energy));
+            
+        case gui_data.STATUS_SWING_FORWARD
+            set(gui_data.swing_status, 'String', 'Estado: Swing-up Avance', 'ForegroundColor', [1, 0.6, 0]);
+            set(gui_data.phase_display, 'String', 'Fase: Avance');
+            set(gui_data.energy_display, 'String', sprintf('Energía: %.2f', energy));
+            
+        case gui_data.STATUS_SWING_BACKWARD
+            set(gui_data.swing_status, 'String', 'Estado: Swing-up Retroceso', 'ForegroundColor', [0.8, 0.6, 0]);
+            set(gui_data.phase_display, 'String', 'Fase: Retroceso');
+            set(gui_data.energy_display, 'String', sprintf('Energía: %.2f', energy));
+            
+        otherwise
+            status_str = gui_data.ctrl.getStatusString(status);
+            set(gui_data.swing_status, 'String', sprintf('Estado: %s', status_str), 'ForegroundColor', [0.5, 0.5, 0.5]);
+            set(gui_data.phase_display, 'String', 'Fase: Desconocida');
+            set(gui_data.energy_display, 'String', sprintf('Valor: %.3f', energy));
     end
 end
 
@@ -1204,8 +1167,8 @@ function update_plots()
                 set(gui_data.line1, 'XData', x_data, 'YData', y_data);
                 xlim(gui_data.ax1, [min(x_data)-1, max(x_data)+1]);
                 % Asegurar que el eje Y muestre todos los estados
-                ylim(gui_data.ax1, [-0.5, 4.5]);
-                set(gui_data.ax1, 'YTick', 0:4, 'YTickLabel', {'Idle', 'Swing', 'Control', 'Stop', 'Upright'});
+                ylim(gui_data.ax1, [-0.5, 7.5]);
+                set(gui_data.ax1, 'YTick', 0:7, 'YTickLabel', {'OK', 'Moving', 'Swing', 'Control', 'Upright', 'SwFwd', 'SwBwd', 'Direct'});
             end
         end
         
@@ -1313,16 +1276,19 @@ function update_plots()
         
         % Debug: Imprimir información cada 50 muestras
         if mod(n_points, 50) == 0
-            swing_mode_str = gui_data.swing_enabled ? 'Swing' : 'Direct';
+            if gui_data.swing_enabled
+                swing_mode_str = 'Swing';
+            else
+                swing_mode_str = 'Direct';
+            end
             fprintf('Graficando [%s]: %d puntos, theta=%.1f°, phi=%.1f°\n', ...
                 swing_mode_str, n_points, gui_data.theta_data(end), gui_data.phi_data(end));
         end
         
     catch ME
         fprintf('Error actualizando gráficas: %s\n', ME.message);
-        fprintf('Stack trace:\n');
-        for i = 1:length(ME.stack)
-            fprintf('  %s (línea %d)\n', ME.stack(i).name, ME.stack(i).line);
+        if ~isempty(ME.stack)
+            fprintf('En función: %s (línea %d)\n', ME.stack(1).name, ME.stack(1).line);
         end
     end
 end
