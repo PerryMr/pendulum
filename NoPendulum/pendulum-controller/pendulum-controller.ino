@@ -1,6 +1,6 @@
 /**
 * @file pendulum-controller-direct.ino
-* @brief Controlador de péndulo invertido - Solo control directo (sin swing-up)
+* @brief Controlador de péndulo invertido - Solo control directo con condición de activación
 * @author Versión modificada para control directo únicamente
 * @date 2025-08-26
 *
@@ -9,7 +9,8 @@
 * 1. Eliminada toda la funcionalidad de swing-up
 * 2. Mantenido solo control PID/LQR directo
 * 3. Simplificado el código eliminando estados de swing-up
-* 4. Conservadas todas las funciones básicas de control
+* 4. AÑADIDO: Control solo activo cuando θ esté en rango 180° ± 10°
+* 5. Conservadas todas las funciones básicas de control
 */
 #include "RotaryEncoder.h"
 #include "L6474.h"
@@ -56,6 +57,7 @@ static const unsigned int STATUS_OK = 0;
 static const unsigned int STATUS_STP_MOVING = 1;
 static const unsigned int STATUS_CONTROL_ACTIVE = 2;
 static const unsigned int STATUS_UPRIGHT_ACHIEVED = 3;
+static const unsigned int STATUS_OUT_OF_RANGE = 4; // NUEVO: Estado fuera de rango
 
 // Physical constants
 const float SAMPLE_TIME = 0.004; // 4ms sampling time
@@ -68,9 +70,14 @@ const float sigma = g/(l*pow(2*PI*1.19, 2));
 const int ENC_STEPS_PER_ROTATION = 1200;
 const int STP_STEPS_PER_ROTATION = 200;
 
-// Control parameters
+// Control parameters - MODIFICADOS para la nueva condición
+const float CONTROL_ACTIVATION_RANGE = 10.0; // ±10° desde 180° para ACTIVAR control
 const float UPRIGHT_THRESHOLD = 15.0; // degrees from 180
 const float SETPOINT = 180.0; // Upright position in degrees
+
+// NUEVOS parámetros para manejo de pérdida de control
+const float CONTROL_DEACTIVATION_RANGE = 25.0; // ±25° desde 180° para DESACTIVAR control
+const unsigned long MAX_OUT_OF_RANGE_TIME = 2000; // 2 segundos máximo fuera de rango
 
 // Controller selection
 typedef enum {
@@ -78,11 +85,12 @@ typedef enum {
   CONTROLLER_LQR = 1
 } ControllerType;
 
-// System states
+// System states - MODIFICADO para incluir nuevos estados
 typedef enum {
   STATE_IDLE = 0,
   STATE_CONTROL = 1,
-  STATE_STOPPED = 2
+  STATE_STOPPED = 2,
+  STATE_WAITING_FOR_RANGE = 3  // NUEVO: Esperando que el péndulo entre en rango
 } SystemState;
 
 // Global variables
@@ -114,6 +122,10 @@ float integral_error = 0.0;
 
 // Reference for control
 float phi_reference = 0.0;
+
+// NUEVAS variables para control de rango
+unsigned long out_of_range_start_time = 0;
+bool was_in_range = false;
 
 // Timing variables
 unsigned long current_time = 0;
@@ -215,6 +227,37 @@ void set_step_mode(int mode) {
 }
 
 /******************************************************************************
+* NUEVAS funciones para verificar rango de control
+*/
+
+// Función para calcular distancia angular más corta desde 180°
+float calculate_distance_from_180(float angle) {
+  float distance = abs(angle - 180.0);
+  if (distance > 180.0) {
+    distance = 360.0 - distance;
+  }
+  return distance;
+}
+
+// Verificar si el péndulo está en rango para ACTIVAR control
+bool is_in_control_activation_range() {
+  float distance = calculate_distance_from_180(theta);
+  return distance <= CONTROL_ACTIVATION_RANGE;
+}
+
+// Verificar si el péndulo está en rango para MANTENER control activo
+bool is_in_control_maintenance_range() {
+  float distance = calculate_distance_from_180(theta);
+  return distance <= CONTROL_DEACTIVATION_RANGE;
+}
+
+// Verificar si está dentro del umbral estricto de "invertido"
+bool is_pendulum_upright() {
+  float distance = calculate_distance_from_180(theta);
+  return distance <= UPRIGHT_THRESHOLD;
+}
+
+/******************************************************************************
 * State estimation
 */
 void update_states() {
@@ -291,16 +334,71 @@ float compute_lqr_control() {
   return control;
 }
 
-bool is_pendulum_upright() {
-  float distance_from_180 = abs(theta - 180.0);
-  if (distance_from_180 > 180.0) {
-    distance_from_180 = 360.0 - distance_from_180;
+/******************************************************************************
+* NUEVA función para gestionar transiciones de estado basadas en rango
+*/
+void manage_control_state_transitions() {
+  bool currently_in_range = is_in_control_maintenance_range();
+  
+  switch (system_state) {
+    case STATE_WAITING_FOR_RANGE:
+      // Esperando que el péndulo entre en rango de activación
+      if (is_in_control_activation_range()) {
+        system_state = STATE_CONTROL;
+        phi_reference = phi; // Usar posición actual como referencia
+        
+        // Reset estados del controlador
+        pid_integral = 0.0;
+        pid_error_prev = 0.0;
+        integral_error = 0.0;
+        
+        out_of_range_start_time = 0;
+        was_in_range = true;
+        
+        Serial.println("*** CONTROL ACTIVADO - PÉNDULO EN RANGO ***");
+        Serial.print("Distancia desde 180°: ");
+        Serial.print(calculate_distance_from_180(theta), 1);
+        Serial.println("°");
+      }
+      break;
+      
+    case STATE_CONTROL:
+      // Control activo - verificar si sale del rango de mantenimiento
+      if (!currently_in_range) {
+        if (was_in_range) {
+          // Primera vez que sale del rango
+          out_of_range_start_time = current_time;
+          was_in_range = false;
+          Serial.println("ADVERTENCIA: Péndulo fuera del rango de control");
+          Serial.print("Distancia desde 180°: ");
+          Serial.print(calculate_distance_from_180(theta), 1);
+          Serial.println("°");
+        } else {
+          // Verificar si ha estado fuera de rango demasiado tiempo
+          if (current_time - out_of_range_start_time > MAX_OUT_OF_RANGE_TIME) {
+            system_state = STATE_WAITING_FOR_RANGE;
+            stepper->hard_stop();
+            Serial.println("*** CONTROL DESACTIVADO - FUERA DE RANGO POR MUCHO TIEMPO ***");
+            Serial.println("Esperando que el péndulo regrese al rango 180° ± 10°");
+          }
+        }
+      } else {
+        // De vuelta en rango
+        if (!was_in_range) {
+          Serial.println("Péndulo de vuelta en rango de control");
+        }
+        was_in_range = true;
+        out_of_range_start_time = 0;
+      }
+      break;
+      
+    default:
+      break;
   }
-  return distance_from_180 <= UPRIGHT_THRESHOLD;
 }
 
 /******************************************************************************
-* Main control state machine
+* Main control state machine - MODIFICADA
 */
 void run_control_loop() {
   // Only run control loop at specified intervals
@@ -310,10 +408,14 @@ void run_control_loop() {
   control_loop_timer = millis();
 
   update_states();
+  
+  // NUEVA: Gestionar transiciones de estado basadas en rango
+  manage_control_state_transitions();
 
   float control_output = 0.0;
 
-  if (system_state == STATE_CONTROL) {
+  // MODIFICADO: Solo aplicar control si está en STATE_CONTROL Y en rango
+  if (system_state == STATE_CONTROL && is_in_control_maintenance_range()) {
     // CONTROL ACTIVO CON STEPPER
     if (current_controller == CONTROLLER_PID) {
       control_output = compute_pid_control();
@@ -338,9 +440,31 @@ void run_control_loop() {
       Serial.print(phi, 1);
       Serial.print("° u:");
       Serial.print(control_output, 2);
-      Serial.print(" upright:");
+      Serial.print(" dist_180:");
+      Serial.print(calculate_distance_from_180(theta), 1);
+      Serial.print("° upright:");
       Serial.println(is_pendulum_upright() ? "YES" : "NO");
       last_debug_print = current_time;
+    }
+  } 
+  // NUEVO: Mensaje cuando está esperando entrar en rango
+  else if (system_state == STATE_WAITING_FOR_RANGE) {
+    if (current_time - last_debug_print > DEBUG_INTERVAL * 2) { // Menos frecuente
+      Serial.print("ESPERANDO RANGO θ:");
+      Serial.print(theta, 1);
+      Serial.print("° dist_180:");
+      Serial.print(calculate_distance_from_180(theta), 1);
+      Serial.print("° (necesita ≤");
+      Serial.print(CONTROL_ACTIVATION_RANGE, 1);
+      Serial.println("°)");
+      last_debug_print = current_time;
+    }
+  }
+  // NUEVO: Detener motor si está fuera de control activo
+  else if (system_state == STATE_CONTROL && !is_in_control_maintenance_range()) {
+    // Asegurarse de que el motor esté detenido cuando está fuera de rango
+    if (stepper->get_device_state() != INACTIVE) {
+      stepper->hard_stop();
     }
   }
 }
@@ -356,7 +480,8 @@ void setup() {
 
   // Initialize communication
   Serial.begin(BAUD_RATE);
-  Serial.println("=== CONTROL PÉNDULO DIRECTO (SIN SWING-UP) ===");
+  Serial.println("=== CONTROL PÉNDULO CON CONDICIÓN DE RANGO ===");
+  Serial.println("MODIFICACIÓN: Control solo activo en rango 180° ± 10°");
   ctrl.init(Serial, CTRL_DEBUG);
 
   // Configure encoder
@@ -386,8 +511,9 @@ void setup() {
   last_debug_print = millis();
 
   Serial.println("=== SISTEMA INICIALIZADO ===");
-  Serial.println("MODO: Control directo únicamente");
-  Serial.println("Para iniciar control, posicione el péndulo cerca de 180° y use el comando START_CONTROL");
+  Serial.println("MODO: Control directo con condición de rango");
+  Serial.println("CONDICIÓN: Control solo activo cuando θ ∈ [170°, 190°]");
+  Serial.println("Para iniciar, use START_CONTROL y posicione el péndulo en rango");
   Serial.println("=== ESPERANDO COMANDOS ===");
 }
 
@@ -397,8 +523,8 @@ void loop() {
   float observation[NUM_OBS];
   ControlComms::StatusCode rx_code;
 
-  // Always run control loop if active
-  if (system_state == STATE_CONTROL) {
+  // Always run control loop if in control states
+  if (system_state == STATE_CONTROL || system_state == STATE_WAITING_FOR_RANGE) {
     run_control_loop();
   }
 
@@ -461,20 +587,39 @@ void loop() {
 
       case CMD_START_CONTROL:
         if (system_state == STATE_IDLE) {
-          system_state = STATE_CONTROL;
-          phi_reference = phi; // Usar posición actual como referencia
-
-          // Reset estados del controlador
-          pid_integral = 0.0;
-          pid_error_prev = 0.0;
-          integral_error = 0.0;
-
-          Serial.println("*** CONTROL DIRECTO INICIADO ***");
-          Serial.print("Controlador: ");
-          Serial.println(current_controller == CONTROLLER_PID ? "PID" : "LQR");
-          Serial.print("Posición inicial θ: "); Serial.print(theta, 1); Serial.println("°");
-          Serial.print("Referencia φ: "); Serial.print(phi_reference, 1); Serial.println("°");
-          Serial.println("POSICIONE EL PÉNDULO CERCA DE 180° PARA MEJOR CONTROL");
+          // MODIFICADO: Iniciar en estado de espera de rango
+          update_states(); // Asegurarse de tener el ángulo actual
+          
+          if (is_in_control_activation_range()) {
+            // Si ya está en rango, activar control inmediatamente
+            system_state = STATE_CONTROL;
+            phi_reference = phi;
+            
+            // Reset estados del controlador
+            pid_integral = 0.0;
+            pid_error_prev = 0.0;
+            integral_error = 0.0;
+            was_in_range = true;
+            
+            Serial.println("*** CONTROL DIRECTO INICIADO - YA EN RANGO ***");
+            Serial.print("Controlador: ");
+            Serial.println(current_controller == CONTROLLER_PID ? "PID" : "LQR");
+            Serial.print("Posición inicial θ: "); Serial.print(theta, 1); Serial.println("°");
+            Serial.print("Distancia desde 180°: "); Serial.print(calculate_distance_from_180(theta), 1); Serial.println("°");
+            Serial.print("Referencia φ: "); Serial.print(phi_reference, 1); Serial.println("°");
+          } else {
+            // Si no está en rango, esperar a que entre
+            system_state = STATE_WAITING_FOR_RANGE;
+            was_in_range = false;
+            
+            Serial.println("*** SISTEMA ACTIVADO - ESPERANDO RANGO ***");
+            Serial.print("Controlador: ");
+            Serial.println(current_controller == CONTROLLER_PID ? "PID" : "LQR");
+            Serial.print("Posición actual θ: "); Serial.print(theta, 1); Serial.println("°");
+            Serial.print("Distancia desde 180°: "); Serial.print(calculate_distance_from_180(theta), 1); Serial.println("°");
+            Serial.print("NECESITA: Posicionar péndulo en rango ±"); Serial.print(CONTROL_ACTIVATION_RANGE, 1); Serial.println("° desde 180°");
+            Serial.println("El control se activará automáticamente cuando entre en rango");
+          }
         } else {
           Serial.println("Error: Sistema no está en estado IDLE");
         }
@@ -483,6 +628,8 @@ void loop() {
       case CMD_STOP_CONTROL:
         system_state = STATE_IDLE;
         stepper->hard_stop();
+        was_in_range = false;
+        out_of_range_start_time = 0;
         Serial.println("*** CONTROL DETENIDO ***");
         break;
 
@@ -502,10 +649,16 @@ void loop() {
     observation[4] = current_controller; // Current controller type
     observation[5] = integral_error; // Integral error
 
-    // Determine status
+    // MODIFICADO: Determine status with new conditions
     int status = STATUS_OK;
     if (system_state == STATE_CONTROL) {
-      status = is_pendulum_upright() ? STATUS_UPRIGHT_ACHIEVED : STATUS_CONTROL_ACTIVE;
+      if (is_in_control_maintenance_range()) {
+        status = is_pendulum_upright() ? STATUS_UPRIGHT_ACHIEVED : STATUS_CONTROL_ACTIVE;
+      } else {
+        status = STATUS_OUT_OF_RANGE; // Nuevo estado para fuera de rango
+      }
+    } else if (system_state == STATE_WAITING_FOR_RANGE) {
+      status = STATUS_OUT_OF_RANGE;
     } else if (stepper->get_device_state() != INACTIVE) {
       status = STATUS_STP_MOVING;
     }
@@ -522,10 +675,30 @@ void loop() {
     }
   }
 
-  // LED de estado
+  // LED de estado - MODIFICADO para indicar diferentes estados
   static unsigned long last_led_update = 0;
-  if (millis() - last_led_update > 1000) {
-    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-    last_led_update = millis();
+  static bool led_state = false;
+  
+  if (system_state == STATE_CONTROL && is_in_control_maintenance_range()) {
+    // Control activo - LED encendido fijo
+    if (millis() - last_led_update > 100) {
+      digitalWrite(LED_PIN, HIGH);
+      last_led_update = millis();
+    }
+  } else if (system_state == STATE_WAITING_FOR_RANGE || 
+             (system_state == STATE_CONTROL && !is_in_control_maintenance_range())) {
+    // Esperando rango o fuera de rango - LED parpadeo rápido
+    if (millis() - last_led_update > 200) {
+      led_state = !led_state;
+      digitalWrite(LED_PIN, led_state);
+      last_led_update = millis();
+    }
+  } else {
+    // Estado idle - LED parpadeo lento
+    if (millis() - last_led_update > 1000) {
+      led_state = !led_state;
+      digitalWrite(LED_PIN, led_state);
+      last_led_update = millis();
+    }
   }
 }
